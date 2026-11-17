@@ -1,82 +1,127 @@
-"""
-Convert OldID + NewID columns of an Excel file to BvdLiens IDs.
-Adds a new sheet "BvDLiens" with columns OldID, NewID (both converted).
+r"""
+Reverse lookup: BvdLiens ID  ->  BvD ID.
+
+Input : queries/obo.sql   (returns a column of BvdLiens IDs, named "Id")
+Output: output/bvdid.parquet   (single column: BvDID)
+
+Built for ~7M rows: resolved server-side in one pass, streamed back in
+chunks, written to parquet row-group by row-group. Memory stays flat.
 
 Usage:
-    python convert_to_bvdliens.py "C:\path\to\input.xlsx"
-    python convert_to_bvdliens.py "C:\path\to\input.xlsx" --sheet Sheet1
+    python liens_to_bvdid.py
+    python liens_to_bvdid.py --sql queries/obo.sql --out output/bvdid.parquet
+    python liens_to_bvdid.py --liens-col NewID
+    python liens_to_bvdid.py --keep-duplicates
 """
 import sys
 import argparse
 from pathlib import Path
 
-import pandas as pd
 import pyodbc
+import pyarrow as pa
+import pyarrow.parquet as pq
 
-from db_connexion import connect_db
+from db_connexion import load_query, prepare_query, connect_db
 
-OUT_SHEET = "BvDLiens"
-COLS = ["OldID", "NewID"]
+# ============================================================
+# ========================= CONFIG ===========================
+# ============================================================
+
+SQL_PATH = Path("queries") / "obo.sql"
+OUT_PATH = Path("output") / "bvdid.parquet"
+
+# Reverse mapping source.
+# In crossref: Id = the BvD ID, NewId = the BvdLiens ID.
+MAP_TABLE = "bvdaffils.dbo.crossref"
+MAP_BVDID_COL = "Id"        # column holding the BvD ID      -> what we want
+MAP_LIENS_COL = "NewId"     # column holding the BvdLiens ID -> what we have
+
+# Column in obo.sql's result that holds the BvdLiens ID.
+LIENS_COL = "Id"
+
+OUT_COL = "BvDID"
+CHUNK = 200_000             # rows fetched + written per batch
+COMPRESSION = "snappy"
+
+# ============================================================
+
+
+def build_sql(obo_sql: str, liens_col: str, dedup: bool) -> str:
+    """Wrap obo.sql as a subquery and join it to the mapping table."""
+    obo_sql = obo_sql.strip().rstrip(";")
+    distinct = "distinct " if dedup else ""
+    return f"""
+with ids as (
+    select distinct src.[{liens_col}] as liens
+    from ({obo_sql}) src
+    where src.[{liens_col}] is not null
+)
+select {distinct}m.[{MAP_BVDID_COL}] as {OUT_COL}
+from ids
+inner join {MAP_TABLE} m
+    on m.[{MAP_LIENS_COL}] = ids.liens
+where m.[{MAP_BVDID_COL}] is not null
+"""
 
 
 @connect_db
-def lookup_liens(conn: pyodbc.Connection, ids: list[str]) -> dict[str, str]:
-    """Send all distinct IDs in one go, convert server-side, return {bvdid: liens_id}."""
+def stream_to_parquet(conn: pyodbc.Connection, sql: str, out_path: Path) -> int:
     cur = conn.cursor()
-    cur.execute("create table #ids (bvdid varchar(50))")
-    cur.fast_executemany = True
-    cur.executemany("insert into #ids (bvdid) values (?)", [(i,) for i in ids])
-    rows = cur.execute(
-        "select bvdid, bvdaffils.dbo.GetBvDLiensID(bvdid) as liens from #ids"
-    ).fetchall()
-    cur.close()
-    return {r.bvdid: r.liens for r in rows}
+    cur.execute(sql)
+
+    schema = pa.schema([(OUT_COL, pa.string())])
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    total = 0
+    writer = pq.ParquetWriter(out_path, schema, compression=COMPRESSION)
+    try:
+        while True:
+            rows = cur.fetchmany(CHUNK)
+            if not rows:
+                break
+            values = [r[0] for r in rows]
+            writer.write_table(
+                pa.table({OUT_COL: pa.array(values, pa.string())}, schema=schema)
+            )
+            total += len(values)
+            print(f"  written: {total:,}", flush=True)
+    finally:
+        writer.close()
+        cur.close()
+    return total
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("xlsx", nargs="?", default="ids.xlsx",
-                    help="input Excel (default: ids.xlsx next to this script)")
-    ap.add_argument("--sheet", default=0, help="input sheet (default: first)")
+    ap.add_argument("--sql", default=str(SQL_PATH), help="path to obo.sql")
+    ap.add_argument("--out", default=str(OUT_PATH), help="output parquet path")
+    ap.add_argument("--liens-col", default=LIENS_COL,
+                    help=f"column in obo.sql holding the BvdLiens ID (default: {LIENS_COL})")
+    ap.add_argument("--keep-duplicates", action="store_true",
+                    help="keep repeated BvD IDs (default: distinct)")
     args = ap.parse_args()
 
-    path = Path(args.xlsx)
-    if not path.is_absolute() and not path.exists():
-        path = Path(__file__).parent / path
-    if not path.exists():
-        sys.exit(f"Input file not found: {path}")
-    df = pd.read_excel(path, sheet_name=args.sheet, dtype=str)
+    sql_path = Path(args.sql)
+    if not sql_path.is_absolute() and not sql_path.exists():
+        sql_path = Path(__file__).parent / sql_path
+    if not sql_path.exists():
+        sys.exit(f"SQL file not found: {sql_path}")
 
-    # find OldID / NewID case-insensitively
-    lower = {c.strip().lower(): c for c in df.columns}
-    missing = [c for c in COLS if c.lower() not in lower]
-    if missing:
-        sys.exit(f"Missing column(s): {missing}. Found: {list(df.columns)}")
-    df = df[[lower[c.lower()] for c in COLS]]
-    df.columns = COLS
+    obo_sql = prepare_query(load_query(str(sql_path)))
+    if not obo_sql.strip():
+        sys.exit(f"{sql_path} is empty")
 
-    for c in COLS:
-        df[c] = df[c].fillna("").str.strip()
+    sql = build_sql(obo_sql, args.liens_col, dedup=not args.keep_duplicates)
 
-    ids = sorted({v for c in COLS for v in df[c] if v})
-    print(f"Distinct IDs to convert: {len(ids)}")
+    print(f"Source : {sql_path}")
+    print(f"Column : {args.liens_col}")
+    print(f"Mapping: {MAP_TABLE} ({MAP_LIENS_COL} -> {MAP_BVDID_COL})")
+    print("Running... (one server-side pass, streamed in chunks)")
 
-    mapping = lookup_liens(ids)
+    out_path = Path(args.out)
+    total = stream_to_parquet(sql, out_path)
 
-    conv = lambda v: mapping.get(v) if v else None
-    out = pd.DataFrame({
-        "OLDID": df["OldID"],
-        "OLD_bvdlien": df["OldID"].map(conv),
-        "NEWID": df["NewID"],
-        "NEW_bvdlien": df["NewID"].map(conv),
-    })
-
-    not_found = sorted(i for i in ids if mapping.get(i) is None)
-    print(f"Converted: {len(ids) - len(not_found)} | No BvdLiens ID: {len(not_found)}")
-
-    with pd.ExcelWriter(path, engine="openpyxl", mode="a", if_sheet_exists="replace") as w:
-        out.to_excel(w, index=False, sheet_name=OUT_SHEET)
-    print(f"Sheet '{OUT_SHEET}' written to {path}")
+    print(f"\nDone. {total:,} BvD IDs -> {out_path.resolve()}")
 
 
 if __name__ == "__main__":
